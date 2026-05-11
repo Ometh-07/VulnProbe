@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VulnProbe - Deep Vulnerability Analysis</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'><circle cx='11' cy='11' r='7' stroke='%23534AB7' stroke-width='1.8'/><path d='M17 17l3.5 3.5' stroke='%237F77DD' stroke-width='2' stroke-linecap='round'/><path d='M8.5 11h5M11 8.5v5' stroke='%23534AB7' stroke-width='1.6' stroke-linecap='round'/></svg>">
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    html, body { width:100%; min-height:100%; font-family:'Segoe UI',system-ui,-apple-system,sans-serif; background:#1a1235; color:#e0e0e0; overflow-x:hidden; overflow-y:auto; }
+    #root { width:100%; min-height:100%; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── constants ────────────────────────────────────────────────────────────────
+
+const API_BASE = window.location.origin; // same-origin: served by Express
+
+const VULNS = {
+  sqli:      { label:'SQL Injection',             color:'#E24B4A', icon:'⚡', desc:'Malicious SQL queries injected via input fields' },
+  xss:       { label:'Cross-Site Scripting',      color:'#534AB7', icon:'📝', desc:'Malicious scripts injected into web pages' },
+  auth:      { label:'Broken Authentication',     color:'#7F77DD', icon:'🔑', desc:'Weak session management or credential handling' },
+  misconfig: { label:'Security Misconfiguration', color:'#534AB7', icon:'⚙', desc:'Improper server/application configuration' },
+  csrf:      { label:'CSRF',                      color:'#7F77DD', icon:'↻', desc:'Cross-site request forgery vulnerabilities' },
+  headers:   { label:'Missing Security Headers',  color:'#534AB7', icon:'🛡', desc:'Absence of protective HTTP headers' },
+};
+
+const SEV_COLORS = { Critical:'#E24B4A', High:'#E24B4A', Medium:'#7F77DD', Low:'#534AB7' };
+
+// ─── export helpers ───────────────────────────────────────────────────────────
+
+const dl = (content, name, mime) => {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 100);
+};
+
+const exportCSV = results => {
+  let c = 'Type,Severity,URL,Parameter,Detail,Remediation\n';
+  results.forEach(r => {
+    const esc = s => `"${s.replace(/"/g,'""')}"`;
+    c += [VULNS[r.type]?.label, r.severity, r.url, r.param, r.detail, r.remediation].map(esc).join(',') + '\n';
+  });
+  dl(c, 'vulnprobe-results.csv', 'text/csv');
+};
+
+const exportJSON = (results, url) =>
+  dl(JSON.stringify({ scanner:'VulnProbe v1.0.0', target:url, timestamp:new Date().toISOString(),
+    summary:{ total:results.length, critical:results.filter(r=>r.severity==='Critical').length,
+      high:results.filter(r=>r.severity==='High').length, medium:results.filter(r=>r.severity==='Medium').length,
+      low:results.filter(r=>r.severity==='Low').length }, vulnerabilities:results }, null, 2),
+    'vulnprobe-results.json', 'application/json');
+
+const exportHTML = (results, targetUrl) => {
+  const sev = { Critical:'#ff2244', High:'#ff6600', Medium:'#ffbb00', Low:'#44ccff' };
+  const rows = results.map(r => `
+    <div style="background:#f9f9f9;padding:16px;margin:10px 0;border-left:4px solid ${sev[r.severity]||'#ccc'};border-radius:4px">
+      <strong style="color:${sev[r.severity]}">[${r.severity}] ${VULNS[r.type]?.label||r.type}</strong>
+      <p><b>URL:</b> ${r.url} &nbsp; <b>Param:</b> ${r.param}</p>
+      <p><b>Detail:</b> ${r.detail}</p>
+      <p><b>Fix:</b> ${r.remediation}</p>
+    </div>`).join('');
+  dl(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>VulnProbe Report</title>
+    <style>body{font-family:Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 20px}</style></head>
+    <body><h1>🎯 VulnProbe Report</h1><p><b>Target:</b> ${targetUrl}</p>
+    <p><b>Date:</b> ${new Date().toLocaleString()}</p><hr>${rows}</body></html>`,
+    'vulnprobe-report.html', 'text/html');
+};
+
+const exportTXT = (results, targetUrl) => {
+  let t = `VULNPROBE VULNERABILITY REPORT\nTarget: ${targetUrl}\nDate: ${new Date().toLocaleString()}\n\n`;
+  results.forEach((r,i) => {
+    t += `${i+1}. [${r.severity}] ${VULNS[r.type]?.label||r.type}\n   URL: ${r.url} | Param: ${r.param}\n   ${r.detail}\n   Fix: ${r.remediation}\n\n`;
+  });
+  dl(t, 'vulnprobe-report.txt', 'text/plain');
+};
+
+const exportPDF = (results, targetUrl) => {
+  const sev = { Critical:'#ff2244', High:'#ff6600', Medium:'#ffbb00', Low:'#44ccff' };
+  const rows = results.map(r => `
+    <tr>
+      <td style="padding:8px; border-bottom:1px solid #ddd;">${VULNS[r.type]?.label||r.type}</td>
+      <td style="padding:8px; border-bottom:1px solid #ddd; color:${sev[r.severity]||'#000'}"><strong>${r.severity}</strong></td>
+      <td style="padding:8px; border-bottom:1px solid #ddd;">${r.url}</td>
+      <td style="padding:8px; border-bottom:1px solid #ddd;">${r.param}</td>
+      <td style="padding:8px; border-bottom:1px solid #ddd;">${r.detail}</td>
+      <td style="padding:8px; border-bottom:1px solid #ddd;">${r.remediation}</td>
+    </tr>`).join('');
+  
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <title>VulnProbe Report</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 20px; color: #333; }
+        h1 { color: #534AB7; border-bottom: 3px solid #534AB7; padding-bottom: 10px; }
+        .info { background: #f5f5f5; padding: 10px; margin: 15px 0; border-radius: 5px; }
+        .summary { margin: 20px 0; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th { background: #534AB7; color: white; padding: 10px; text-align: left; }
+        td { padding: 8px; border-bottom: 1px solid #ddd; }
+        .critical { color: #E24B4A; font-weight: bold; }
+        .high { color: #E24B4A; font-weight: bold; }
+        .medium { color: #7F77DD; font-weight: bold; }
+        .low { color: #534AB7; font-weight: bold; }
+      </style>
+    </head>
+    <body>
+      <h1>🎯 VulnProbe - Vulnerability Report</h1>
+      <div class="info">
+        <p><strong>Target URL:</strong> ${targetUrl}</p>
+        <p><strong>Report Generated:</strong> ${new Date().toLocaleString()}</p>
+        <p><strong>Scanner:</strong> VulnProbe v1.0.0 • Find it before they do.</p>
+      </div>
+      
+      <div class="summary">
+        <h2>Summary</h2>
+        <p><strong>Total Vulnerabilities:</strong> ${results.length}</p>
+        <p><span class="critical">Critical: ${results.filter(r=>r.severity==='Critical').length}</span> | 
+           <span class="high">High: ${results.filter(r=>r.severity==='High').length}</span> | 
+           <span class="medium">Medium: ${results.filter(r=>r.severity==='Medium').length}</span> | 
+           <span class="low">Low: ${results.filter(r=>r.severity==='Low').length}</span></p>
+      </div>
+
+      <h2>Detailed Findings</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Vulnerability Type</th>
+            <th>Severity</th>
+            <th>URL</th>
+            <th>Parameter</th>
+            <th>Detail</th>
+            <th>Remediation</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    </body>
+    </html>`;
+  
+  const element = document.createElement('div');
+  element.innerHTML = html;
+  const opt = {
+    margin: 10,
+    filename: 'vulnprobe-report.pdf',
+    image: { type: 'jpeg', quality: 0.98 },
+    html2canvas: { scale: 2 },
+    jsPDF: { orientation: 'landscape', unit: 'mm', format: 'a4' }
+  };
+  window.html2pdf().set(opt).from(element).save();
+};
+
+// ─── sub-components ───────────────────────────────────────────────────────────
+
+function TerminalLine({ text, color='#b0ffa0' }) {
+  return <div style={{ color, fontFamily:"'Courier New',monospace", fontSize:13, lineHeight:1.6 }}>{text}</div>;
+}
+
+function ScanProgress({ progress, phase }) {
+  return (
+    <div style={{ marginTop:20 }}>
+      <div style={{ display:'flex', justifyContent:'space-between', marginBottom:6 }}>
+        <span style={{ color:'#534AB7', fontFamily:'monospace', fontSize:12 }}>{phase}</span>
+        <span style={{ color:'#534AB7', fontFamily:'monospace', fontSize:12 }}>{progress}%</span>
+      </div>
+      <div style={{ background:'#2d1b4e', borderRadius:4, height:8, overflow:'hidden', border:'1px solid #534AB722' }}>
+        <div style={{ height:'100%', width:`${progress}%`, background:'linear-gradient(90deg,#534AB7,#7F77DD)',
+          borderRadius:4, transition:'width 0.4s ease', boxShadow:'0 0 12px #534AB788' }} />
+      </div>
+    </div>
+  );
+}
+
+function VulnCard({ vuln, index }) {
+  const [expanded, setExpanded] = useState(false);
+  const info = VULNS[vuln.type] || { label: vuln.type, icon:'⚠', color:'#aaa' };
+  return (
+    <div onClick={() => setExpanded(!expanded)} style={{
+      background:'rgba(255,255,255,0.03)', border:`1px solid ${SEV_COLORS[vuln.severity]}44`,
+      borderLeft:`3px solid ${SEV_COLORS[vuln.severity]}`, borderRadius:8, padding:'14px 18px',
+      marginBottom:10, cursor:'pointer', transition:'all 0.2s',
+      animation:`fadeSlideIn 0.3s ease ${index*0.06}s both`,
+    }}>
+      <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+        <span style={{ fontSize:20 }}>{info.icon}</span>
+        <div style={{ flex:1 }}>
+          <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+            <span style={{ color:'#eee', fontWeight:600, fontSize:14 }}>{info.label}</span>
+            <span style={{ background:SEV_COLORS[vuln.severity]+'22', color:SEV_COLORS[vuln.severity],
+              border:`1px solid ${SEV_COLORS[vuln.severity]}66`, borderRadius:20, padding:'1px 10px',
+              fontSize:11, fontWeight:700, letterSpacing:1 }}>{vuln.severity}</span>
+          </div>
+          <div style={{ color:'#888', fontSize:12, marginTop:2 }}>
+            <code style={{ color:'#7F77DD', background:'#7F77DD11', padding:'1px 6px', borderRadius:3 }}>{vuln.url}</code>
+            {vuln.param !== '-' && <span style={{ marginLeft:8 }}>param: <code style={{ color:'#534AB7' }}>{vuln.param}</code></span>}
+          </div>
+        </div>
+        <span style={{ color:'#555', fontSize:18, transition:'transform 0.2s', transform:expanded?'rotate(180deg)':'none' }}>▾</span>
+      </div>
+      {expanded && (
+        <div style={{ marginTop:14, paddingTop:14, borderTop:'1px solid #ffffff0f' }}>
+          <div style={{ color:'#bbb', fontSize:13, marginBottom:8 }}>🔍 {vuln.detail}</div>
+          <div style={{ background:'#534AB711', border:'1px solid #534AB722', borderRadius:6, padding:'10px 14px' }}>
+            <span style={{ color:'#534AB7', fontWeight:600, fontSize:12 }}>✅ FIX: </span>
+            <span style={{ color:'#aaa', fontSize:12 }}>{vuln.remediation}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DonutChart({ data }) {
+  const total  = Object.values(data).reduce((a,b)=>a+b, 0);
+  if (!total) return null;
+  const colors = { Critical:'#ff2244', High:'#ff6600', Medium:'#ffbb00', Low:'#44ccff' };
+  const r=45, cx=60, cy=60, circ=2*Math.PI*r;
+  let offset=0;
+  const slices = Object.entries(data).map(([sev,count]) => {
+    const dash=count/total*circ, sl={ sev, dash, gap:circ-dash, offset };
+    offset+=dash; return sl;
+  });
+  return (
+    <svg width={120} height={120} viewBox="0 0 120 120">
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#1a1a2e" strokeWidth={16}/>
+      {slices.map(({sev,dash,gap,offset:off})=>(
+        <circle key={sev} cx={cx} cy={cy} r={r} fill="none" stroke={colors[sev]} strokeWidth={14}
+          strokeDasharray={`${dash} ${gap}`} strokeDashoffset={-off+circ/4}/>
+      ))}
+      <text x={cx} y={cy-4} textAnchor="middle" fill="#fff" fontSize="16" fontWeight="bold">{total}</text>
+      <text x={cx} y={cy+12} textAnchor="middle" fill="#888" fontSize="8">ISSUES</text>
+    </svg>
+  );
+}
+
+// ─── main app ─────────────────────────────────────────────────────────────────
+
+function App() {
+  const [page,       setPage]       = useState('dashboard');
+  const [targetUrl,  setTargetUrl]  = useState('https://');
+  const [scanTypes,  setScanTypes]  = useState({ sqli:true, xss:true, auth:true, misconfig:true, csrf:true, headers:true });
+  const [scanState,  setScanState]  = useState('idle'); // idle | scanning | complete | error
+  const [progress,   setProgress]   = useState(0);
+  const [phase,      setPhase]      = useState('');
+  const [results,    setResults]    = useState([]);
+  const [logs,       setLogs]       = useState([]);
+  const [errMsg,     setErrMsg]     = useState('');
+  const [filter,     setFilter]     = useState('All');
+  const [showOpts,   setShowOpts]   = useState(true);
+  const esRef       = useRef(null);
+  const termRef     = useRef(null);
+
+  const filteredResults = filter === 'All' ? results : results.filter(r => r.severity === filter);
+  const sevCounts = results.reduce((acc,r)=>{ acc[r.severity]=(acc[r.severity]||0)+1; return acc; }, {});
+
+  // auto-scroll terminal
+  useEffect(() => {
+    if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
+  }, [logs]);
+
+  const startScan = useCallback(() => {
+    if (!targetUrl || targetUrl === 'https://') { setErrMsg('Please enter a target URL.'); return; }
+
+    // close old stream
+    if (esRef.current) { esRef.current.close(); esRef.current = null; }
+
+    setScanState('scanning');
+    setResults([]);
+    setLogs([]);
+    setProgress(0);
+    setPhase('Starting...');
+    setErrMsg('');
+
+    const activeTypes = Object.entries(scanTypes).filter(([,v])=>v).map(([k])=>k).join(',');
+    const url = `${API_BASE}/api/scan?url=${encodeURIComponent(targetUrl)}&types=${encodeURIComponent(activeTypes)}`;
+    const es  = new EventSource(url);
+    esRef.current = es;
+
+    es.onmessage = e => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'log') {
+        setLogs(prev => [...prev, { text: msg.text, color: msg.color }]);
+      } else if (msg.type === 'progress') {
+        setProgress(msg.progress);
+        setPhase(msg.phase);
+      } else if (msg.type === 'finding') {
+        setResults(prev => [...prev, msg.vuln]);
+      } else if (msg.type === 'complete') {
+        setScanState('complete');
+        setProgress(100);
+        es.close();
+        
+        // Save results to MongoDB
+        if (results.length > 0) {
+          fetch(`${API_BASE}/api/save-scan`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              targetUrl,
+              results,
+              timestamp: new Date().toISOString(),
+            }),
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.success) {
+              setLogs(prev => [...prev, { text: `✓ Scan results saved to database (ID: ${data.scanId})`, color: '#44ff99' }]);
+            }
+          })
+          .catch(err => console.error('Failed to save scan:', err));
+        }
+      } else if (msg.type === 'error') {
+        setErrMsg(msg.message);
+        setScanState('error');
+        es.close();
+      }
+    };
+
+    es.onerror = () => {
+      if (esRef.current) {
+        setErrMsg('Connection to scanner lost. Is the server running?');
+        setScanState('error');
+        es.close();
+      }
+    };
+  }, [targetUrl, scanTypes]);
+
+  const stopScan = () => {
+    if (esRef.current) { esRef.current.close(); esRef.current = null; }
+    setScanState('idle');
+  };
+
+  const navItems = [
+    { id:'dashboard', icon:'▪', label:'Dashboard' },
+    { id:'scan',      icon:'🎯', label:'Hunt Targets' },
+    { id:'results',   icon:'✓', label:'Hunt Results' },
+    { id:'reports',   icon:'📊', label:'Reports' },
+  ];
+
+  return (
+    <div style={{ minHeight:'100vh', background:'#0a0a14', color:'#e0e0e0', display:'flex' }}>
+      <style>{`
+        @keyframes fadeSlideIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:#0a0a14} ::-webkit-scrollbar-thumb{background:#333}
+        input,select{outline:none} button{cursor:pointer}
+      `}</style>
+
+      {/* ── sidebar ── */}
+      <div style={{ width:220, background:'#0d0d1a', borderRight:'1px solid #1a1a2e', display:'flex', flexDirection:'column', padding:'0 0 20px', flexShrink:0 }}>
+        <div style={{ padding:'28px 20px 20px', borderBottom:'1px solid #3d2d5f' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+            <div style={{ width:36, height:36, background:'linear-gradient(135deg,#534AB7,#7F77DD)', borderRadius:8, display:'flex', alignItems:'center', justifyContent:'center', fontSize:18 }}>🔍</div>
+            <div>
+              <div style={{ fontSize:14, fontWeight:800, color:'#fff', letterSpacing:-0.5 }}><span style={{color:'#EEEDFE'}}>Vuln</span><span style={{color:'#534AB7'}}>Probe</span></div>
+              <div style={{ fontSize:10, color:'#534AB7', letterSpacing:1 }}>DEEP ANALYSIS</div>
+            </div>
+          </div>
+        </div>
+
+        <nav style={{ flex:1, padding:'16px 12px' }}>
+          {navItems.map(item=>(
+            <button key={item.id} onClick={()=>setPage(item.id)} style={{
+              width:'100%', display:'flex', alignItems:'center', gap:10, padding:'10px 12px',
+              borderRadius:8, border:'none', marginBottom:4,
+              background: page===item.id ? 'linear-gradient(90deg,#534AB722,#7F77DD11)' : 'transparent',
+              borderLeft: page===item.id ? '2px solid #534AB7' : '2px solid transparent',
+              color: page===item.id ? '#534AB7' : '#888',
+              fontWeight: page===item.id ? 600 : 400, fontSize:14, transition:'all 0.15s', textAlign:'left',
+            }}>
+              <span>{item.icon}</span>{item.label}
+              {item.id==='results' && results.length>0 && (
+                <span style={{ marginLeft:'auto', background:'#534AB7', color:'#fff', borderRadius:10, padding:'1px 7px', fontSize:10, fontWeight:700 }}>{results.length}</span>
+              )}
+            </button>
+          ))}
+        </nav>
+
+        <div style={{ padding:'12px 20px', background:'#534AB708', margin:'0 12px', borderRadius:8, border:'1px solid #534AB722' }}>
+          <div style={{ fontSize:10, color:'#534AB7', letterSpacing:1, marginBottom:6 }}>LAST PROBE</div>
+          {results.length > 0 ? (
+            <>
+              <div style={{ fontSize:12, color:'#888' }}>{new Date().toLocaleTimeString()}</div>
+              <div style={{ fontSize:12, color:results.some(r=>r.severity==='Critical')?'#ff2244':'#ff6600', marginTop:2 }}>{results.length} issues tracked</div>
+            </>
+          ) : (
+            <div style={{ fontSize:12, color:'#444' }}>No hunt yet</div>
+          )}
+        </div>
+      </div>
+
+      {/* ── main content ── */}
+      <div style={{ flex:1, overflow:'auto', padding:'32px 40px' }}>
+
+        {/* ─── DASHBOARD ─── */}
+        {page==='dashboard' && (
+          <div style={{ animation:'fadeSlideIn 0.4s ease' }}>
+            <div style={{ marginBottom:32 }}>
+              <h1 style={{ fontSize:28, fontWeight:800, color:'#fff', margin:0, letterSpacing:-0.5 }}>VulnProbe Dashboard</h1>
+              <p style={{ color:'#666', marginTop:6, fontSize:14 }}>Find it before they do.</p>
+            </div>
+
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:32 }}>
+              {[
+                { label:'Total Issues',  value:results.length,            color:'#fff',    sub:'Current hunt' },
+                { label:'Critical',      value:sevCounts.Critical||0,     color:'#ff2244', sub:'Immediate action' },
+                { label:'High',          value:sevCounts.High||0,         color:'#ff6600', sub:'Fix soon' },
+                { label:'Scan Status',   value:scanState==='scanning'?'◉':'◯', color:'#7F77DD', sub:scanState },
+              ].map((s,i)=>(
+                <div key={i} style={{ background:'rgba(83,74,183,0.08)', border:'1px solid #3d2d5f', borderRadius:12, padding:20 }}>
+                  <div style={{ fontSize:11, color:'#888', letterSpacing:1, marginBottom:10 }}>{s.label.toUpperCase()}</div>
+                  <div style={{ fontSize:32, fontWeight:800, color:s.color, marginBottom:4 }}>{s.value}</div>
+                  <div style={{ fontSize:12, color:'#888' }}>{s.sub}</div>
+                </div>
+              ))}
+            </div>
+
+            {results.length > 0 && (
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 2fr', gap:20, marginBottom:32 }}>
+                <div style={{ background:'rgba(255,255,255,0.03)', border:'1px solid #1a1a2e', borderRadius:12, padding:24, display:'flex', flexDirection:'column', alignItems:'center', gap:16 }}>
+                  <div style={{ fontSize:13, color:'#888', fontWeight:600, alignSelf:'flex-start' }}>Severity Breakdown</div>
+                  <DonutChart data={sevCounts}/>
+                  <div style={{ display:'flex', flexWrap:'wrap', gap:'6px 12px', justifyContent:'center' }}>
+                    {Object.entries(sevCounts).map(([sev,n])=>(
+                      <span key={sev} style={{ fontSize:11, color:SEV_COLORS[sev] }}>● {sev}: {n}</span>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ background:'rgba(255,255,255,0.03)', border:'1px solid #1a1a2e', borderRadius:12, padding:24 }}>
+                  <div style={{ fontSize:13, color:'#888', fontWeight:600, marginBottom:16 }}>Recent Findings</div>
+                  {results.slice(0,4).map((v,i)=><VulnCard key={v.id} vuln={v} index={i}/>)}
+                  {results.length>4 && (
+                    <button onClick={()=>setPage('results')} style={{ marginTop:8, background:'#534AB711', color:'#534AB7', border:'1px solid #534AB733', borderRadius:8, padding:'8px 16px', fontSize:12, fontWeight:600 }}>
+                      View all {results.length} findings →
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {results.length === 0 && (
+              <div style={{ background:'rgba(83,74,183,0.05)', border:'1px dashed #3d2d5f', borderRadius:12, padding:48, textAlign:'center' }}>
+                <div style={{ fontSize:48, marginBottom:16 }}>🔍</div>
+                <div style={{ fontSize:18, color:'#888', marginBottom:8 }}>Ready to probe for vulnerabilities.</div>
+                <div style={{ fontSize:14, color:'#666', marginBottom:20 }}>Find it before they do.</div>
+                <button onClick={()=>setPage('scan')} style={{ background:'linear-gradient(90deg,#534AB7,#7F77DD)', color:'#fff', border:'none', borderRadius:8, padding:'12px 28px', fontWeight:800, fontSize:14 }}>
+                  🔍 Start Probe
+                </button>
+              </div>
+            )}
+
+            {/* OWASP coverage */}
+            <div style={{ background:'rgba(255,255,255,0.02)', border:'1px solid #1a1a2e', borderRadius:12, padding:24 }}>
+              <div style={{ fontSize:14, fontWeight:700, color:'#fff', marginBottom:16 }}>OWASP Top 10 Coverage</div>
+              <div style={{ display:'grid', gridTemplateColumns:'repeat(2,1fr)', gap:8 }}>
+                {[
+                  ['A01','Broken Access Control',true],['A02','Cryptographic Failures',false],
+                  ['A03','Injection (SQLi)',true],['A04','Insecure Design',false],
+                  ['A05','Security Misconfiguration',true],['A06','Vulnerable Components',false],
+                  ['A07','Authentication Failures',true],['A08','Data Integrity Failures',false],
+                  ['A09','Logging & Monitoring',false],['A10','SSRF',false],
+                ].map(([id,name,covered])=>(
+                  <div key={id} style={{ display:'flex', alignItems:'center', gap:8, padding:'6px 10px', background:'rgba(255,255,255,0.02)', borderRadius:6 }}>
+                    <span style={{ color:covered?'#534AB7':'#333', fontSize:12 }}>{covered?'●':'○'}</span>
+                    <span style={{ fontSize:11, color:'#888' }}>{id}</span>
+                    <span style={{ fontSize:12, color:covered?'#ccc':'#555' }}>{name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ─── SCAN ─── */}
+        {page==='scan' && (
+          <div style={{ animation:'fadeSlideIn 0.4s ease', maxWidth:800 }}>
+            <h1 style={{ fontSize:26, fontWeight:800, color:'#fff', margin:'0 0 6px' }}>Hunt Targets</h1>
+            <p style={{ color:'#666', fontSize:14, marginBottom:24 }}>
+              ⚠ Only scan websites you own or have explicit written permission to test.
+            </p>
+
+            {/* Target URL */}
+            <div style={{ background:'rgba(83,74,183,0.08)', border:'1px solid #3d2d5f', borderRadius:12, padding:24, marginBottom:20 }}>
+              <div style={{ fontSize:13, color:'#aaa', marginBottom:10, fontWeight:600 }}>TARGET URL</div>
+              <div style={{ display:'flex', gap:10 }}>
+                <input value={targetUrl} onChange={e=>setTargetUrl(e.target.value)}
+                  placeholder="https://example.com"
+                  disabled={scanState==='scanning'}
+                  style={{ flex:1, background:'#2d1b4e', border:'1px solid #3d2d5f', borderRadius:8, padding:'12px 16px',
+                    color:'#fff', fontSize:14, fontFamily:'monospace' }}
+                />
+              </div>
+              {errMsg && <div style={{ marginTop:10, color:'#E24B4A', fontSize:13 }}>⚠ {errMsg}</div>}
+            </div>
+
+            {/* Scan types */}
+            {showOpts && (
+              <div style={{ background:'rgba(83,74,183,0.08)', border:'1px solid #3d2d5f', borderRadius:12, padding:24, marginBottom:20 }}>
+                <div style={{ fontSize:13, color:'#aaa', marginBottom:14, fontWeight:600 }}>SCAN MODULES</div>
+                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+                  {Object.entries(VULNS).map(([key,info])=>(
+                    <label key={key} style={{ display:'flex', alignItems:'center', gap:12, padding:'12px 14px',
+                      background: scanTypes[key] ? `${info.color}15` : '#ffffff03',
+                      border:`1px solid ${scanTypes[key] ? info.color+'44' : '#3d2d5f'}`,
+                      borderRadius:8, cursor:'pointer', transition:'all 0.15s' }}>
+                      <input type="checkbox" checked={scanTypes[key]}
+                        onChange={e=>setScanTypes(s=>({...s,[key]:e.target.checked}))}
+                        style={{ accentColor:info.color, width:16, height:16 }} />
+                      <span style={{ fontSize:16 }}>{info.icon}</span>
+                      <div>
+                        <div style={{ fontSize:13, color:'#ddd', fontWeight:500 }}>{info.label}</div>
+                        <div style={{ fontSize:11, color:'#555' }}>{info.desc}</div>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+            <button onClick={()=>setShowOpts(s=>!s)} style={{ background:'transparent', border:'none', color:'#555', fontSize:12, marginBottom:16, padding:0 }}>
+              {showOpts ? '▲ Hide options' : '▼ Show scan options'}
+            </button>
+
+            {/* Terminal output */}
+            <div style={{ background:'#2d1b4e', border:'1px solid #3d2d5f', borderRadius:12, padding:24, marginBottom:20 }}>
+              <div style={{ display:'flex', gap:6, marginBottom:16 }}>
+                {['#534AB7','#7F77DD','#E24B4A'].map(c=><div key={c} style={{ width:10, height:10, borderRadius:'50%', background:c }}/>)}
+              </div>
+
+              <div ref={termRef} style={{ maxHeight:220, overflowY:'auto' }}>
+                {scanState==='idle' && logs.length===0 && (
+                  <div style={{ color:'#666', fontFamily:'monospace', fontSize:13 }}>
+                    <span style={{ color:'#534AB7' }}>$</span> Ready to probe. Enter a URL and press <span style={{ color:'#7F77DD' }}>Start Probe</span>.
+                  </div>
+                )}
+                {logs.map((line,i)=><TerminalLine key={i} text={line.text} color={line.color}/>)}
+                {scanState==='scanning' && (
+                  <div style={{ color:'#534AB7', fontFamily:'monospace', fontSize:13, animation:'pulse 1s infinite' }}>█</div>
+                )}
+              </div>
+
+              {scanState==='scanning' && <ScanProgress progress={progress} phase={phase}/>}
+
+              {scanState==='complete' && (
+                <div style={{ marginTop:16, padding:'12px 16px', background:'#534AB715', border:'1px solid #534AB733', borderRadius:8 }}>
+                  <span style={{ color:'#534AB7', fontWeight:700 }}>✓ Probe complete!</span>
+                  <span style={{ color:'#888', fontSize:13, marginLeft:10 }}>{results.length} vulnerabilities found</span>
+                </div>
+              )}
+
+              {scanState==='error' && (
+                <div style={{ marginTop:16, padding:'12px 16px', background:'#E24B4A15', border:'1px solid #E24B4A33', borderRadius:8 }}>
+                  <span style={{ color:'#E24B4A', fontWeight:700 }}>✗ Probe failed:</span>
+                  <span style={{ color:'#888', fontSize:13, marginLeft:10 }}>{errMsg}</span>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+              {scanState !== 'scanning' && (
+                <button onClick={startScan} style={{ background:'linear-gradient(90deg,#534AB7,#7F77DD)', color:'#fff', border:'none', borderRadius:8, padding:'13px 28px', fontWeight:800, fontSize:15, letterSpacing:0.5, boxShadow:'0 0 20px #534AB744' }}>
+                  {scanState==='complete' ? '↻ Probe Again' : '🔍 Start Probe'}
+                </button>
+              )}
+              {scanState === 'scanning' && (
+                <button onClick={stopScan} style={{ background:'#E24B4A22', color:'#E24B4A', border:'1px solid #E24B4A44', borderRadius:8, padding:'13px 24px', fontWeight:700, fontSize:14 }}>
+                  ■ Stop
+                </button>
+              )}
+              {scanState==='complete' && results.length>0 && (
+                <button onClick={()=>setPage('results')} style={{ background:'#7F77DD22', color:'#7F77DD', border:'1px solid #7F77DD44', borderRadius:8, padding:'13px 28px', fontWeight:700, fontSize:15 }}>
+                  View Results →
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ─── RESULTS ─── */}
+        {page==='results' && (
+          <div style={{ animation:'fadeSlideIn 0.4s ease' }}>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-end', marginBottom:28, flexWrap:'wrap', gap:16 }}>
+              <div>
+                <h1 style={{ fontSize:26, fontWeight:800, color:'#fff', margin:0 }}>Probe Results</h1>
+                <p style={{ color:'#888', marginTop:6, fontSize:14, marginBottom:0 }}>
+                  {results.length>0 ? `${results.length} vulnerabilities found — ${targetUrl}` : 'No results yet — run a probe first'}
+                </p>
+                <p style={{ color:'#666', marginTop:4, fontSize:12 }}>Find it before they do.</p>
+              </div>
+              <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+                {['All','Critical','High','Medium','Low'].map(f=>(
+                  <button key={f} onClick={()=>setFilter(f)} style={{
+                    padding:'7px 14px', borderRadius:20, border:`1px solid ${filter===f?(SEV_COLORS[f]||'#534AB7'):'#3d2d5f'}`,
+                    background: filter===f ? `${SEV_COLORS[f]||'#534AB7'}18` : 'transparent',
+                    color: filter===f ? (SEV_COLORS[f]||'#534AB7') : '#666', fontSize:12, fontWeight:600,
+                  }}>{f} {f!=='All' && sevCounts[f] ? `(${sevCounts[f]})` : ''}</button>
+                ))}
+              </div>
+            </div>
+
+            {filteredResults.length===0 ? (
+              <div style={{ textAlign:'center', padding:'80px 0', color:'#555' }}>
+                <div style={{ fontSize:48, marginBottom:16 }}>🔍</div>
+                <div style={{ fontSize:16 }}>{results.length===0 ? 'Start a probe to see results' : 'No results match this filter'}
+                <div style={{ fontSize:13, color:'#666', marginTop:8 }}>Find it before they do.</div></div>
+                {results.length===0 && (
+                  <button onClick={()=>setPage('scan')} style={{ marginTop:20, background:'#534AB722', color:'#534AB7', border:'1px solid #534AB744', borderRadius:8, padding:'10px 24px', fontWeight:700 }}>
+                    Begin Probe
+                  </button>
+                )}
+              </div>
+            ) : filteredResults.map((v,i)=><VulnCard key={v.id} vuln={v} index={i}/>)}
+          </div>
+        )}
+
+        {/* ─── REPORTS ─── */}
+        {page==='reports' && (
+          <div style={{ animation:'fadeSlideIn 0.4s ease', maxWidth:700 }}>
+            <h1 style={{ fontSize:26, fontWeight:800, color:'#fff', margin:'0 0 8px' }}>Reports & Exports</h1>
+            <p style={{ color:'#666', fontSize:14, marginBottom:28 }}>Export your vulnerability findings in multiple formats</p>
+
+            {results.length===0 && (
+              <div style={{ padding:'20px 24px', background:'#7F77DD11', border:'1px solid #7F77DD33', borderRadius:10, marginBottom:24, color:'#7F77DD', fontSize:14 }}>
+                ⚠️ No probe results yet. Run a probe first to generate reports.
+              </div>
+            )}
+
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16, marginBottom:28 }}>
+              {[
+                { format:'PDF Report',       icon:'📄', desc:'Full vulnerability report with remediation', color:'#E24B4A', action:()=>exportPDF(results,targetUrl) },
+                { format:'CSV Export',       icon:'📊', desc:'Structured data for spreadsheet analysis',  color:'#534AB7', action:()=>exportCSV(results) },
+                { format:'JSON Export',      icon:'{ }',desc:'Machine-readable format for CI/CD',         color:'#7F77DD', action:()=>exportJSON(results,targetUrl) },
+                { format:'HTML Report',      icon:'🌍', desc:'Shareable web-based report',               color:'#534AB7', action:()=>exportHTML(results,targetUrl) },
+              ].map((r,i)=>(
+                <div key={i} style={{ background:'rgba(83,74,183,0.08)', border:'1px solid #3d2d5f', borderRadius:12, padding:22 }}>
+                  <div style={{ fontSize:28, marginBottom:10 }}>{r.icon}</div>
+                  <div style={{ fontWeight:700, color:'#eee', marginBottom:6 }}>{r.format}</div>
+                  <div style={{ fontSize:12, color:'#999', marginBottom:16 }}>{r.desc}</div>
+                  <button onClick={r.action} disabled={results.length===0} style={{
+                    background:`${r.color}15`, border:`1px solid ${r.color}33`, color:results.length?r.color:'#555',
+                    borderRadius:6, padding:'8px 16px', fontSize:13, fontWeight:600, width:'100%',
+                    cursor:results.length?'pointer':'not-allowed',
+                  }}>↓ Download</button>
+                </div>
+              ))}
+            </div>
+
+            {results.length>0 && (
+              <div style={{ background:'rgba(83,74,183,0.05)', border:'1px solid #3d2d5f', borderRadius:12, padding:24 }}>
+                <div style={{ fontWeight:700, color:'#fff', marginBottom:16 }}>Summary Preview</div>
+                <div style={{ background:'#2d1b4e', borderRadius:8, padding:20, fontFamily:'monospace', fontSize:12 }}>
+                  <div style={{ color:'#534AB7', marginBottom:12 }}>═══ VULNPROBE VULNERABILITY REPORT ═══</div>
+                  <div style={{ color:'#999', marginBottom:4 }}>Target:  {targetUrl}</div>
+                  <div style={{ color:'#999', marginBottom:4 }}>Date:    {new Date().toLocaleString()}</div>
+                  <div style={{ color:'#999', marginBottom:16 }}>Scanner: VulnProbe v1.0.0 • Find it before they do.</div>
+                  {Object.entries(SEV_COLORS).map(([sev,col])=>(
+                    sevCounts[sev] ? <div key={sev} style={{ color:col }}>{sev.toUpperCase()} ({sevCounts[sev]}): {results.filter(r=>r.severity===sev).map(r=>VULNS[r.type]?.label||r.type).join(', ')}</div> : null
+                  ))}
+                  <div style={{ color:'#534AB7', marginTop:12 }}>Total: {results.length} issue(s) found</div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
