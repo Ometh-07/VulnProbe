@@ -271,6 +271,12 @@ function App() {
   const [errMsg,     setErrMsg]     = useState('');
   const [filter,     setFilter]     = useState('All');
   const [showOpts,   setShowOpts]   = useState(true);
+  const [verifyDomain, setVerifyDomain] = useState('');
+  const [verifyToken,  setVerifyToken]  = useState('');
+  const [verifyStatus, setVerifyStatus] = useState(null);
+  const [verifyMessage, setVerifyMessage] = useState('');
+  const [verifyBusy, setVerifyBusy] = useState(false);
+  const [verifyCheckedAt, setVerifyCheckedAt] = useState(null);
   const esRef       = useRef(null);
   const termRef     = useRef(null);
 
@@ -282,8 +288,104 @@ function App() {
     if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
   }, [logs]);
 
-  const startScan = useCallback(() => {
+  const apiVerifyInit = async domain => {
+    const res = await fetch(`${API_BASE}/api/verify/init`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain }),
+    });
+    return res.json();
+  };
+
+  const apiVerifyStatus = async domain => {
+    const res = await fetch(`${API_BASE}/api/verify/status?domain=${encodeURIComponent(domain)}`);
+    return res.json();
+  };
+
+  const createVerificationToken = async () => {
+    if (!verifyDomain) {
+      setVerifyMessage('Enter a domain before generating a verification token.');
+      return;
+    }
+
+    setVerifyBusy(true);
+    setVerifyMessage('Generating verification token...');
+
+    const result = await apiVerifyInit(verifyDomain);
+    if (result.success) {
+      setVerifyToken(result.token);
+      setVerifyStatus({ verified: result.verified, verificationStatus: result.verificationStatus, verifiedBy: result.verifiedBy });
+      setVerifyMessage(result.verified ? 'Domain already verified.' : 'Verification token created. Follow one of the methods below.');
+    } else {
+      setVerifyMessage(result.error || 'Unable to create verification token.');
+    }
+
+    setVerifyBusy(false);
+    setVerifyCheckedAt(new Date().toLocaleString());
+  };
+
+  const refreshVerificationStatus = async () => {
+    if (!verifyDomain) {
+      setVerifyMessage('Enter a domain to check its verification status.');
+      return;
+    }
+
+    setVerifyBusy(true);
+    setVerifyMessage('Checking verification status...');
+    const result = await apiVerifyStatus(verifyDomain);
+    if (result.success) {
+      setVerifyToken(result.token || '');
+      setVerifyStatus({ verified: result.verified, verificationStatus: result.verificationStatus, verifiedBy: result.verifiedBy });
+      setVerifyMessage(result.verified ? 'Domain is verified.' : 'Domain is not verified yet. Follow one of the methods below.');
+    } else {
+      setVerifyMessage(result.error || 'Unable to check verification status.');
+    }
+    setVerifyBusy(false);
+    setVerifyCheckedAt(new Date().toLocaleString());
+  };
+
+  const confirmVerification = async () => {
+    if (!verifyDomain) {
+      setVerifyMessage('Enter a domain to confirm verification.');
+      return;
+    }
+
+    setVerifyBusy(true);
+    setVerifyMessage('Confirming verification...');
+    const res = await fetch(`${API_BASE}/api/verify/confirm`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain: verifyDomain }),
+    });
+    const result = await res.json();
+    if (result.success) {
+      setVerifyToken(result.token || verifyToken);
+      setVerifyStatus({ verified: result.verified, verificationStatus: result.verificationStatus, verifiedBy: result.verifiedBy });
+      setVerifyMessage(result.verified ? 'Verification confirmed.' : 'Verification failed. Make sure the token is present and retry.');
+    } else {
+      setVerifyMessage(result.error || 'Unable to confirm verification.');
+    }
+    setVerifyBusy(false);
+    setVerifyCheckedAt(new Date().toLocaleString());
+  };
+
+  const startScan = useCallback(async () => {
     if (!targetUrl || targetUrl === 'https://') { setErrMsg('Please enter a target URL.'); return; }
+
+    let host;
+    try {
+      host = new URL(targetUrl).hostname;
+    } catch {
+      setErrMsg('Please enter a valid target URL.');
+      return;
+    }
+
+    if (!['localhost', '127.0.0.1', '::1'].includes(host)) {
+      const status = await apiVerifyStatus(host);
+      if (!status.success || !status.verified) {
+        setErrMsg(`Target ${host} is not verified. Verify ownership before scanning.`);
+        setScanState('error');
+        return;
+      }
+    }
 
     // close old stream
     if (esRef.current) { esRef.current.close(); esRef.current = null; }
@@ -355,10 +457,11 @@ function App() {
   };
 
   const navItems = [
-    { id:'dashboard', icon:'▪', label:'Dashboard' },
-    { id:'scan',      icon:'🎯', label:'Hunt Targets' },
-    { id:'results',   icon:'✓', label:'Hunt Results' },
-    { id:'reports',   icon:'📊', label:'Reports' },
+    { id:'dashboard', icon:'', label:'Dashboard' },
+    { id:'scan',      icon:'', label:'Probe Targets' },
+    { id:'verify',    icon:'', label:'Verify Domain' },
+    { id:'results',   icon:'', label:'Probe Results' },
+    { id:'reports',   icon:'', label:'Reports' },
   ];
 
   return (
@@ -408,7 +511,7 @@ function App() {
               <div style={{ fontSize:12, color:results.some(r=>r.severity==='Critical')?'#ff2244':'#ff6600', marginTop:2 }}>{results.length} issues tracked</div>
             </>
           ) : (
-            <div style={{ fontSize:12, color:'#444' }}>No hunt yet</div>
+            <div style={{ fontSize:12, color:'#444' }}>No probe yet</div>
           )}
         </div>
       </div>
@@ -426,7 +529,7 @@ function App() {
 
             <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:32 }}>
               {[
-                { label:'Total Issues',  value:results.length,            color:'#fff',    sub:'Current hunt' },
+                { label:'Total Issues',  value:results.length,            color:'#fff',    sub:'Current probe' },
                 { label:'Critical',      value:sevCounts.Critical||0,     color:'#ff2244', sub:'Immediate action' },
                 { label:'High',          value:sevCounts.High||0,         color:'#ff6600', sub:'Fix soon' },
                 { label:'Scan Status',   value:scanState==='scanning'?'◉':'◯', color:'#7F77DD', sub:scanState },
@@ -498,7 +601,7 @@ function App() {
         {/* ─── SCAN ─── */}
         {page==='scan' && (
           <div style={{ animation:'fadeSlideIn 0.4s ease', maxWidth:800 }}>
-            <h1 style={{ fontSize:26, fontWeight:800, color:'#fff', margin:'0 0 6px' }}>Hunt Targets</h1>
+            <h1 style={{ fontSize:26, fontWeight:800, color:'#fff', margin:'0 0 6px' }}>Probe Targets</h1>
             <p style={{ color:'#666', fontSize:14, marginBottom:24 }}>
               ⚠ Only scan websites you own or have explicit written permission to test.
             </p>
@@ -596,6 +699,93 @@ function App() {
                 </button>
               )}
             </div>
+          </div>
+        )}
+
+        {/* ─── VERIFY ─── */}
+        {page==='verify' && (
+          <div style={{ animation:'fadeSlideIn 0.4s ease', maxWidth:840 }}>
+            <h1 style={{ fontSize:26, fontWeight:800, color:'#fff', margin:'0 0 6px' }}>Verify Domain Ownership</h1>
+            <p style={{ color:'#666', fontSize:14, marginBottom:24 }}>
+              Use one of three verification methods to prove ownership of a target domain before scanning it.
+            </p>
+
+            <div style={{ background:'rgba(83,74,183,0.08)', border:'1px solid #3d2d5f', borderRadius:12, padding:24, marginBottom:20 }}>
+              <div style={{ fontSize:13, color:'#aaa', marginBottom:10, fontWeight:600 }}>DOMAIN TO VERIFY</div>
+              <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
+                <input value={verifyDomain} onChange={e=>setVerifyDomain(e.target.value)}
+                  placeholder="example.com"
+                  style={{ flex:1, minWidth:240, background:'#2d1b4e', border:'1px solid #3d2d5f', borderRadius:8, padding:'12px 16px', color:'#fff', fontSize:14, fontFamily:'monospace' }}
+                />
+                <button onClick={createVerificationToken} disabled={verifyBusy} style={{ background:'linear-gradient(90deg,#534AB7,#7F77DD)', color:'#fff', border:'none', borderRadius:8, padding:'12px 20px', fontWeight:700, fontSize:13 }}>
+                  Generate Token
+                </button>
+                <button onClick={refreshVerificationStatus} disabled={verifyBusy} style={{ background:'#1f1c3d', color:'#fff', border:'1px solid #534AB7', borderRadius:8, padding:'12px 20px', fontWeight:700, fontSize:13 }}>
+                  Refresh Status
+                </button>
+                <button onClick={confirmVerification} disabled={verifyBusy} style={{ background:'#7F77DD22', color:'#7F77DD', border:'1px solid #7F77DD44', borderRadius:8, padding:'12px 20px', fontWeight:700, fontSize:13 }}>
+                  Confirm
+                </button>
+              </div>
+              {verifyMessage && <div style={{ marginTop:14, color:'#ccc', fontSize:13 }}>{verifyMessage}</div>}
+              {verifyCheckedAt && <div style={{ marginTop:6, color:'#555', fontSize:11 }}>Last checked: {verifyCheckedAt}</div>}
+            </div>
+
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16, marginBottom:20 }}>
+              <div style={{ background:'rgba(255,255,255,0.03)', border:'1px solid #3d2d5f', borderRadius:12, padding:20 }}>
+                <div style={{ fontSize:13, color:'#aaa', fontWeight:700, marginBottom:12 }}>Verification Status</div>
+                <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:14 }}>
+                  <span style={{ width:10, height:10, borderRadius:'50%', background:verifyStatus?.verified ? '#44ff99' : '#ffbb00' }}></span>
+                  <span style={{ color:'#ddd', fontSize:14, fontWeight:600 }}>
+                    {verifyStatus?.verified ? 'Verified' : 'Not verified yet'}
+                  </span>
+                </div>
+                <div style={{ fontSize:12, color:'#888', lineHeight:1.6 }}>
+                  {verifyStatus?.verifiedBy ? `Verified by ${verifyStatus.verifiedBy === 'meta' ? 'HTML meta tag' : verifyStatus.verifiedBy === 'file' ? 'file upload' : 'DNS TXT record'}.` : 'Generate a token and use one of the methods below.'}
+                </div>
+              </div>
+
+              <div style={{ background:'rgba(255,255,255,0.03)', border:'1px solid #3d2d5f', borderRadius:12, padding:20 }}>
+                <div style={{ fontSize:13, color:'#aaa', fontWeight:700, marginBottom:12 }}>Current Token</div>
+                <div style={{ fontSize:15, color:'#fff', wordBreak:'break-all', padding:'14px', background:'#1b1636', borderRadius:10, border:'1px solid #2e2655' }}>
+                  {verifyToken || 'No token generated yet.'}
+                </div>
+              </div>
+            </div>
+
+            {verifyToken && (
+              <div style={{ display:'grid', gap:14 }}>
+                <div style={{ background:'rgba(255,255,255,0.02)', border:'1px solid #3d2d5f', borderRadius:12, padding:20 }}>
+                  <div style={{ fontSize:13, color:'#aaa', fontWeight:700, marginBottom:10 }}>HTML META TAG</div>
+                  <div style={{ fontSize:13, color:'#ddd', marginBottom:10 }}>
+                    Add this meta tag inside the <code style={{ color:'#7F77DD' }}>&lt;head&gt;</code> section of your homepage.
+                  </div>
+                  <div style={{ background:'#0f0d24', border:'1px solid #2e2655', borderRadius:10, padding:14, fontFamily:'monospace', fontSize:13 }}>
+                    {`<meta name="vulnprobe-verification" content="${verifyToken}" />`}
+                  </div>
+                </div>
+
+                <div style={{ background:'rgba(255,255,255,0.02)', border:'1px solid #3d2d5f', borderRadius:12, padding:20 }}>
+                  <div style={{ fontSize:13, color:'#aaa', fontWeight:700, marginBottom:10 }}>FILE UPLOAD</div>
+                  <div style={{ fontSize:13, color:'#ddd', marginBottom:10 }}>
+                    Upload a plain text file to your site root containing only the token.
+                  </div>
+                  <div style={{ background:'#0f0d24', border:'1px solid #2e2655', borderRadius:10, padding:14, fontFamily:'monospace', fontSize:13 }}>
+                    {`/vulnprobe-verify-${verifyToken}.txt`}
+                  </div>
+                </div>
+
+                <div style={{ background:'rgba(255,255,255,0.02)', border:'1px solid #3d2d5f', borderRadius:12, padding:20 }}>
+                  <div style={{ fontSize:13, color:'#aaa', fontWeight:700, marginBottom:10 }}>DNS TXT RECORD</div>
+                  <div style={{ fontSize:13, color:'#ddd', marginBottom:10 }}>
+                    Add a TXT record on your domain with this exact value.
+                  </div>
+                  <div style={{ background:'#0f0d24', border:'1px solid #2e2655', borderRadius:10, padding:14, fontFamily:'monospace', fontSize:13 }}>
+                    {`vulnprobe-verification=${verifyToken}`}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
