@@ -7,6 +7,8 @@ const cors    = require('cors');
 const fetch   = require('node-fetch');
 const https   = require('https');
 const cheerio = require('cheerio');
+const crypto  = require('crypto');
+const dns     = require('dns').promises;
 const { URL } = require('url');
 const path    = require('path');
 const { getDatabase } = require('./db');
@@ -41,7 +43,7 @@ async function safeFetch(url, baseOpts = {}, extraOpts = {}) {
       agent,
       signal: controller.signal,
       headers: {
-        'User-Agent': 'RabbitHunt/1.0 Security Scanner',
+        'User-Agent': 'RabbitProbe/1.0 Security Scanner',
         Accept: '*/*',
       },
       redirect: 'manual',
@@ -65,6 +67,202 @@ async function safeText(res, maxBytes = 500_000) {
     return '';
   }
 }
+
+function normalizeDomain(domainInput) {
+  if (!domainInput || typeof domainInput !== 'string') {
+    throw new Error('Domain is required');
+  }
+
+  let effective = domainInput.trim();
+  if (!effective.includes('://')) {
+    effective = `http://${effective}`;
+  }
+
+  const parsed = new URL(effective);
+  if (!parsed.hostname) {
+    throw new Error('Invalid domain');
+  }
+
+  return parsed.hostname.toLowerCase();
+}
+
+async function getDomainRecord(domain) {
+  const db = await getDatabase();
+  return db.collection('domains').findOne({ domain });
+}
+
+async function createDomainRecord(domain) {
+  const db = await getDatabase();
+  const token = crypto.randomBytes(16).toString('hex');
+  const now = new Date();
+
+  const record = {
+    domain,
+    token,
+    verified: false,
+    verifiedBy: null,
+    verificationStatus: { html: false, file: false, dns: false },
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await db.collection('domains').updateOne({ domain }, { $setOnInsert: record }, { upsert: true });
+  return await getDomainRecord(domain);
+}
+
+async function updateDomainVerification(domain, statuses) {
+  const db = await getDatabase();
+  const verified = Boolean(statuses.html || statuses.file || statuses.dns);
+  const method = statuses.html ? 'meta' : statuses.file ? 'file' : statuses.dns ? 'dns' : null;
+  const now = new Date();
+
+  await db.collection('domains').updateOne(
+    { domain },
+    {
+      $set: {
+        verified,
+        verifiedBy: method,
+        verificationStatus: statuses,
+        verifiedAt: verified ? now : null,
+        updatedAt: now,
+      },
+    },
+    { upsert: true }
+  );
+
+  return { verified, verifiedBy: method, verificationStatus: statuses };
+}
+
+async function checkHtmlVerification(domain, token) {
+  const urls = [`https://${domain}/`, `http://${domain}/`];
+  for (const url of urls) {
+    const response = await safeFetch(url, {}, {});
+    if (!response || response.status >= 400) continue;
+    const body = await safeText(response);
+    const $ = cheerio.load(body);
+    const content = $('meta[name="vulnprobe-verification"]').attr('content');
+    if (content && content.trim() === token) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function checkFileVerification(domain, token) {
+  const urls = [`https://${domain}/vulnprobe-verify-${token}.txt`, `http://${domain}/vulnprobe-verify-${token}.txt`];
+  for (const url of urls) {
+    const response = await safeFetch(url, {}, {});
+    if (!response || response.status !== 200) continue;
+    const body = await safeText(response, 10000);
+    if (body.trim() === token) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function checkDnsVerification(domain, token) {
+  try {
+    const records = await dns.resolveTxt(domain);
+    const flattened = records.flat().map(part => part.trim()).join(' ');
+    if (flattened.includes(token) || flattened.includes(`vulnprobe-verification=${token}`)) {
+      return true;
+    }
+  } catch {
+    // ignore DNS lookup failures
+  }
+  return false;
+}
+
+async function getVerificationStatuses(domain, token) {
+  const [html, file, dnsStatus] = await Promise.all([
+    checkHtmlVerification(domain, token),
+    checkFileVerification(domain, token),
+    checkDnsVerification(domain, token),
+  ]);
+
+  return {
+    html,
+    file,
+    dns: dnsStatus,
+    verified: html || file || dnsStatus,
+    method: html ? 'meta' : file ? 'file' : dnsStatus ? 'dns' : null,
+  };
+}
+
+async function isDomainVerified(domain) {
+  const record = await getDomainRecord(domain);
+  return record?.verified === true;
+}
+
+app.post('/api/verify/init', async (req, res) => {
+  try {
+    const domain = normalizeDomain(req.body.domain);
+    const existing = await getDomainRecord(domain);
+    const record = existing || await createDomainRecord(domain);
+
+    res.json({
+      success: true,
+      domain: record.domain,
+      token: record.token,
+      verified: Boolean(record.verified),
+      verifiedBy: record.verifiedBy || null,
+      verificationStatus: record.verificationStatus || { html: false, file: false, dns: false },
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/verify/status', async (req, res) => {
+  try {
+    const domain = normalizeDomain(req.query.domain);
+    const record = await getDomainRecord(domain);
+    if (!record) {
+      return res.json({ success: true, domain, verified: false, token: null, verificationStatus: { html: false, file: false, dns: false } });
+    }
+
+    const statuses = await getVerificationStatuses(domain, record.token);
+    if (statuses.verified && !record.verified) {
+      await updateDomainVerification(domain, statuses);
+    }
+
+    res.json({
+      success: true,
+      domain,
+      token: record.token,
+      verified: statuses.verified || Boolean(record.verified),
+      verifiedBy: statuses.method || record.verifiedBy || null,
+      verificationStatus: statuses,
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/verify/confirm', async (req, res) => {
+  try {
+    const domain = normalizeDomain(req.body.domain);
+    const record = await getDomainRecord(domain);
+    if (!record) {
+      return res.status(404).json({ success: false, error: 'Domain record not found. Generate a token first.' });
+    }
+
+    const statuses = await getVerificationStatuses(domain, record.token);
+    const update = await updateDomainVerification(domain, statuses);
+
+    res.json({
+      success: true,
+      domain,
+      token: record.token,
+      verified: update.verified,
+      verifiedBy: update.verifiedBy,
+      verificationStatus: update.verificationStatus,
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
 
 // ─── SSE scan endpoint ────────────────────────────────────────────────────────
 
@@ -95,6 +293,16 @@ app.get('/api/scan', async (req, res) => {
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
   } catch {
     send({ type: 'error', message: 'Invalid URL. Use http:// or https://' });
+    return res.end();
+  }
+
+  const host = parsed.hostname;
+  const allowLocal = ['localhost', '127.0.0.1', '::1'];
+  if (!allowLocal.includes(host) && !(await isDomainVerified(host))) {
+    send({
+      type: 'error',
+      message: `Scan blocked. ${host} is not verified. Verify domain ownership before scanning.`,
+    });
     return res.end();
   }
 
@@ -203,7 +411,7 @@ app.get('/api/scan', async (req, res) => {
       // CORS misconfiguration
       const corsRes = await safeFetch(targetUrl, {}, {
         headers: {
-          'User-Agent': 'RabbitHunt/1.0 Security Scanner',
+          'User-Agent': 'RabbitProbe/1.0 Security Scanner',
           Origin: 'https://evil-attacker.example.com',
         },
       });
@@ -526,7 +734,7 @@ app.get('/api/scan', async (req, res) => {
     // ─── Done ──────────────────────────────────────────────────────────────────
 
     progress(100, 'Complete');
-    log('[✓] Hunt complete!', '#ff6b9d');
+    log('[✓] Probe complete!', '#ff6b9d');
     send({ type: 'complete' });
     res.end();
 
@@ -595,14 +803,34 @@ app.get('/api/scans', async (req, res) => {
   }
 });
 
-app.listen(PORT, async () => {
-  console.log(`\n�  VulnProbe is running → http://localhost:${PORT}\n`);
-  console.log('  ⚠️  Only scan sites you own or have explicit permission to test.\n');
+function startServer(port, attempts = 0) {
+  const server = app.listen(port, async () => {
+    console.log(`\n�  VulnProbe is running → http://localhost:${port}\n`);
+    console.log('  ⚠️  Only scan sites you own or have explicit permission to test.\n');
 
-  try {
-    await getDatabase();
-    console.log('📊 Database connection ready\n');
-  } catch (err) {
-    console.error('⚠️  Database connection failed. Continuing without persistence.\n');
-  }
-});
+    try {
+      await getDatabase();
+      console.log('📊 Database connection ready\n');
+    } catch (err) {
+      console.error('⚠️  Database connection failed. Continuing without persistence.\n');
+    }
+  });
+
+  server.on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+      if (attempts < 3) {
+        const nextPort = port + 1;
+        console.warn(`Port ${port} is already in use. Trying ${nextPort} instead...`);
+        startServer(nextPort, attempts + 1);
+        return;
+      }
+      console.error(`\n✗ Port ${port} is already in use. Please stop the running process or set PORT to an available port.`);
+      process.exit(1);
+    }
+
+    console.error('Server failed to start:', err);
+    process.exit(1);
+  });
+}
+
+startServer(PORT);
