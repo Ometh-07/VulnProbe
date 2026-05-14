@@ -6,6 +6,7 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const https   = require('https');
+const net     = require('net');
 const cheerio = require('cheerio');
 const crypto  = require('crypto');
 const dns     = require('dns').promises;
@@ -84,6 +85,25 @@ function normalizeDomain(domainInput) {
   }
 
   return parsed.hostname.toLowerCase();
+}
+
+function isPrivateIp(address) {
+  if (!address || typeof address !== 'string') return false;
+
+  if (net.isIPv4(address)) {
+    return /^(10\.|192\.168\.|127\.|169\.254\.)/.test(address);
+  }
+
+  if (net.isIPv6(address)) {
+    return address === '::1' || address.toLowerCase().startsWith('::ffff:127.0.0.1');
+  }
+
+  return false;
+}
+
+async function resolveHostAddresses(hostname) {
+  const records = await dns.lookup(hostname, { all: true });
+  return records.map(record => record.address);
 }
 
 async function getDomainRecord(domain) {
@@ -297,7 +317,25 @@ app.get('/api/scan', async (req, res) => {
   }
 
   const host = parsed.hostname;
-  const allowLocal = ['localhost', '127.0.0.1', '::1'];
+  const allowLocal = ['localhost'];
+
+  try {
+    const addresses = await resolveHostAddresses(host);
+    if (!allowLocal.includes(host) && addresses.some(isPrivateIp)) {
+      send({
+        type: 'error',
+        message: `Scan blocked. ${host} resolves to a private or local IP address and may be used for SSRF.`,
+      });
+      return res.end();
+    }
+  } catch {
+    send({
+      type: 'error',
+      message: `Scan blocked. Unable to resolve target hostname ${host}.`,
+    });
+    return res.end();
+  }
+
   if (!allowLocal.includes(host) && !(await isDomainVerified(host))) {
     send({
       type: 'error',
