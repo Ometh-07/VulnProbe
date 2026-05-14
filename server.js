@@ -842,7 +842,7 @@ app.get('/api/scans', async (req, res) => {
 });
 
 function startServer(port, attempts = 0) {
-  const server = app.listen(port, async () => {
+  const server = app.listen(port, '0.0.0.0', async () => {
     console.log(`\n�  VulnProbe is running → http://localhost:${port}\n`);
     console.log('  ⚠️  Only scan sites you own or have explicit permission to test.\n');
 
